@@ -1,6 +1,7 @@
 import random
 import time
 from datetime import date
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Cyber Defender", page_icon="🛡️", layout="centered")
@@ -116,6 +117,77 @@ BANKS = [
     ("Eindscenario", "Neem vier veilige beslissingen.", "final", FINAL_EVENTS, []),
 ]
 
+# De geheime Supabase service-role key wordt uitsluitend op de Streamlit-server gebruikt.
+# Deel deze sleutel nooit via GitHub, een QR-code of een browser.
+def database_config():
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).rstrip("/")
+        key = str(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", ""))
+        return (url, key) if url.startswith("https://") and key else (None, None)
+    except Exception:
+        return None, None
+
+
+def score_headers(key):
+    return {"apikey": key, "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"}
+
+
+def get_live_scores():
+    url, key = database_config()
+    if not url:
+        return None
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/cyber_scores",
+            headers=score_headers(key),
+            params={"select": "name,score,xp,rank,created_at", "order": "score.desc,created_at.asc", "limit": "10"},
+            timeout=6,
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def save_live_score(record):
+    url, key = database_config()
+    if not url:
+        return False
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/cyber_scores",
+            headers={**score_headers(key), "Prefer": "return=minimal"},
+            json={"name": record["name"], "score": record["score"],
+                  "xp": record["xp"], "rank": record["rank"]},
+            timeout=6,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException:
+        return False
+
+
+def display_leaderboard():
+    scores = get_live_scores()
+    if scores is None:
+        st.warning("Live scores zijn nog niet beschikbaar. Controleer de Supabase-instellingen of verbinding.")
+        scores = st.session_state.scores
+        st.caption("Tijdelijke scores van deze browsersessie")
+    else:
+        st.caption("🌐 Gezamenlijke top 10 · wordt automatisch vernieuwd")
+    if not scores:
+        st.info("Nog geen scores. Start een training!")
+    for i, row in enumerate(scores, 1):
+        medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i:02d}."
+        st.markdown(f"**{medal} {row['name']}** — **{row['score']} punten** · {row['rank']}")
+
+
+@st.fragment(run_every="5s")
+def live_leaderboard():
+    display_leaderboard()
+
+
 def init():
     if 'phase' not in st.session_state:
         st.session_state.phase='menu'
@@ -164,7 +236,9 @@ def finish(won,game_over=False):
     if not s.saved:
         s.scores.append(dict(name=s.name,score=s.score,xp=s.xp,rank=rank_for_xp(s.xp),date=str(date.today())))
         s.scores.sort(key=lambda r:r['score'],reverse=True)
-        s.scores=s.scores[:10];s.saved=True
+        s.scores=s.scores[:10]
+        s.live_saved=save_live_score(dict(name=s.name,score=s.score,xp=s.xp,rank=rank_for_xp(s.xp)))
+        s.saved=True
 
 def continue_game():
     s=st.session_state;level=s.levels[s.level_index]
@@ -185,6 +259,12 @@ init()
 s=st.session_state
 st.title('◈ CYBER DEFENDER')
 st.caption('CYBERSECURITY TRAINING SIMULATOR · WEB EDITION')
+if st.query_params.get('board') == '1':
+    st.header('🏆 LIVE LEADERBOARD')
+    st.caption('CYBER DEFENDER SHOWCASE · TOP 10')
+    live_leaderboard()
+    st.stop()
+
 
 if s.phase=='menu':
     st.header('BESCHERM WAT BELANGRIJK IS.')
@@ -193,6 +273,7 @@ if s.phase=='menu':
     if st.button('🎮 START GAME',type='primary'):s.phase='name';st.rerun()
     if st.button('📖 HOW TO PLAY'):s.phase='howto';st.rerun()
     if st.button('🏆 HIGH SCORES'):s.phase='scores';st.rerun()
+    st.markdown('**📺 Monitorweergave:** open `?board=1` achter de URL van deze app.')
     st.caption('Fictieve oefenscenario’s. Gebruik geen echte wachtwoorden.')
 elif s.phase=='name':
     st.header('Kies je codenaam')
@@ -209,11 +290,8 @@ elif s.phase=='howto':
     st.write('**05 Klim omhoog:** afgerond level = 500 bonuspunten en XP.')
     if st.button('TERUG NAAR MENU'):s.phase='menu';st.rerun()
 elif s.phase=='scores':
-    st.header('HIGH SCORES')
-    st.caption('Scores van deze browsersessie; niet gedeeld tussen spelers.')
-    if not s.scores:st.info('Nog geen scores. Start een training!')
-    for i,row in enumerate(s.scores,1):
-        st.write(f"**{i:02d}. {row['name']}** — {row['score']} punten · {row['rank']}")
+    st.header('🏆 LIVE HIGH SCORES')
+    live_leaderboard()
     if st.button('TERUG NAAR MENU'):s.phase='menu';st.rerun()
 elif s.phase=='question':
     level=s.levels[s.level_index];q=level['questions'][s.question_index]
@@ -258,7 +336,10 @@ elif s.phase=='result':
     a,b,c,d=st.columns(4)
     a.metric('SCORE',s.score);b.metric('XP',s.xp);c.metric('GOED',s.correct);d.metric('FOUT',s.mistakes)
     st.subheader(f'RANK · {rank_for_xp(s.xp).upper()}')
-    st.caption('Score is tijdelijk opgeslagen voor deze browsersessie.')
+    if getattr(s, 'live_saved', False):
+        st.success('Je score is toegevoegd aan het gezamenlijke leaderboard!')
+    else:
+        st.warning('Score lokaal bewaard. Online opslaan is nog niet ingesteld of niet bereikbaar.')
     if st.button('OPNIEUW',type='primary'):s.phase='name';st.rerun()
     if st.button('HIGH SCORES'):s.phase='scores';st.rerun()
     if st.button('HOOFDMENU'):s.phase='menu';st.rerun()
